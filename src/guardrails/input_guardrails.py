@@ -11,6 +11,7 @@ Status convention (không dùng True/False mơ hồ):
 from __future__ import annotations
 
 import re
+import unicodedata
 from typing import Literal
 
 from google.genai import types
@@ -42,6 +43,145 @@ InputStatus = Literal["ALLOW", "BLOCK"]
 # Regex is one signal, not the whole security boundary.
 # ============================================================
 
+_INVISIBLE_CHARS = re.compile(r"[​-‏‪-‮⁠-⁤­﻿]")
+
+
+# Cyrillic / Greek letters that look like Latin ones (homoglyph attack: "Ignоre")
+_CONFUSABLES = str.maketrans({
+    "а": "a", "е": "e", "о": "o", "р": "p", "с": "c",
+    "у": "y", "х": "x", "і": "i", "ј": "j", "ѕ": "s",
+    "к": "k", "м": "m", "т": "t", "ԁ": "d",
+    "А": "A", "В": "B", "Е": "E", "К": "K", "М": "M",
+    "Н": "H", "О": "O", "Р": "P", "С": "C", "Т": "T",
+    "Х": "X", "І": "I",
+    "α": "a", "ο": "o", "ι": "i", "ν": "v", "ρ": "p",
+    "τ": "t", "υ": "u",
+    "Α": "A", "Β": "B", "Ε": "E", "Ζ": "Z", "Η": "H",
+    "Ι": "I", "Κ": "K", "Μ": "M", "Ν": "N", "Ο": "O",
+    "Ρ": "P", "Τ": "T", "Χ": "X", "Υ": "Y",
+})
+
+
+def _canonicalize(text: str) -> str:
+    """NFKC-normalize, strip invisible chars, map homoglyphs to Latin, remove
+    diacritics, collapse spaces."""
+    text = unicodedata.normalize("NFKC", text or "")
+    text = _INVISIBLE_CHARS.sub("", text)
+    text = text.translate(_CONFUSABLES)
+    text = unicodedata.normalize("NFD", text)
+    text = "".join(c for c in text if unicodedata.category(c) != "Mn")
+    text = text.replace("đ", "d").replace("Đ", "D")
+    return re.sub(r"\s+", " ", text).strip()
+
+
+_EXTRA_BANKING_RE = re.compile(
+    r"\b(bank|banks|card|cards|debit|pin(?!\s*ball)|otp|branch|branches|fee|fees|statement|"
+    r"statements|mortgage|cheque|check\s*book|remittance|exchange\s*rate|"
+    r"opening\s*hours|phone\s*number|internet\s*banking|online\s*banking|"
+    r"mobile\s*banking|send\s*money|wire|swift|iban|"
+    r"chi\s*nhanh|phi\s*chuyen|sao\s*ke)\b",
+    re.IGNORECASE,
+)
+
+
+# Harmful-intent terms beyond config.BLOCKED_TOPICS. Whole-word / explicit forms
+# only, so ordinary customers are not caught ("I forgot my PIN", "report fraud").
+_EXTRA_BLOCKED_RE = re.compile(
+    r"\b(launder\w*|counterfeit\w*|malware|ransomware|ddos|money\s*mule|"
+    r"tax\s*evasion|evade\s*tax\w*|fake\s*(id|passport|documents?)|"
+    r"forg(e|ed|ery|ing)|bypass\s*(kyc|aml))\b",
+    re.IGNORECASE,
+)
+
+
+INJECTION_PATTERNS = [
+        # Override / forget previous instructions
+        r"(ignore|disregard|forget|override|bypass)\s*(all\s*)?(the\s*|your\s*|any\s*)?"
+        r"(previous|above|prior|earlier|preceding|system)?\s*"
+        r"(instructions?|rules?|prompts?|guidelines?|directives?|restrictions?)",
+        # Role switching
+        r"you\s*are\s*now\b",
+        r"(pretend|imagine)\s*(that\s*)?(you\s*are|to\s*be|you're)",
+        r"act\s*as\s*(a\s*|an\s*)?(unrestricted|unfiltered|jailbroken|dan\b|developer)",
+        r"\b(dan|developer)\s*mode\b|\bjailbreak",
+        # Prompt / secret extraction
+        r"system\s*prompt",
+        r"(reveal|show|print|display|repeat|output|leak|tell\s*me)\s*(me\s*)?(your|the)?\s*"
+        r"(hidden\s*|internal\s*|initial\s*)?(instructions?|prompt|configuration|credentials?)",
+        r"(admin|internal|root)\s*(password|credentials?)|\bapi[\s_-]*key\b|\bdb[\s_-]*host\b|"
+        r"connection\s*string",
+        # Exfiltration via transform: encode/translate/summarize hidden config
+        r"(encode|base64|rot13|hex(adecimal)?|decode|translate|summari[sz]e|convert|rewrite|spell)\b.{0,200}"
+        r"(internal|hidden|secret|your|system)\s*(config\w*|notes?|settings|credentials?|instructions?|rules|secrets?)",
+        # SQL / command injection
+        r"select\s+\*\s+from|union\s+select|(drop|truncate)\s+(table|database)|"
+        r"delete\s+from\s+\w+\s*(where|;)|insert\s+into\s+\w+|;\s*--",
+        # Vietnamese
+        r"(bo\s*qua|quen|bypass)\s*(tat\s*ca\s*)?(moi\s*)?(huong\s*dan|chi\s*dan|quy\s*tac|lenh)",
+        r"(tiet\s*lo|cho\s*(toi\s*)?(biet|xem))\s*(mat\s*khau|system\s*prompt|api\s*key)",
+        # Obey encoded / hidden instructions
+        r"(decode|decrypt|deobfuscate)\b.{0,60}\b(obey|follow|execute|run|and\s*do|instructions?)",
+        r"(obey|follow|execute|run)\s*(the\s*|these\s*)?(following\s*|decoded\s*|hidden\s*|encoded\s*|base64\s*)+"
+        r"(instructions?|commands?|text|message)",
+        # A secret requested together with an encoding / spelling trick
+        r"(password|passwd|api[\s_-]*key|secret|credentials?|token)\b.{0,50}\b"
+        r"(base64|hex(adecimal)?|rot13|encoded|character\s*by\s*character|one\s*character)",
+        r"(base64|hex(adecimal)?|rot13|encode\w*)\b.{0,50}\b(password|passwd|api[\s_-]*key|secret|credentials?)",
+        # Credentials of a backend system, even when paraphrased
+        r"(login|auth\w*|connection)\s*(credentials?|settings?|details)\b.{0,80}\b(backend|service|system|server|database|internal)|"
+        r"\b(backend|service|system|server|database|internal)\b.{0,80}\b(login|auth\w*|connection)\s*(credentials?|settings?|details)",
+        r"(service|system|backend|database|db|root|administrator)\s*(password|passwd|pwd|credentials?)",
+        # Other languages (diacritics are already removed by _canonicalize)
+        r"ignor(a|ar|e|ez|iere)\s*(todas?\s*|toutes?\s*|alle\s*)?(tus\s*|las\s*|vos\s*|les\s*|deine\s*|die\s*)?"
+        r"(instrucciones|instructions|anweisungen|reglas|regles|regeln)",
+        r"(olvida|oublie|vergiss)\s*(tus\s*|vos\s*|deine\s*)?(instrucciones|instructions|anweisungen)",
+        r"(contrasena|mot\s*de\s*passe|passwort|clave\s*api|cle\s*api)\s*(del?\s*|de\s*l\W?)?"
+        r"(admin\w*|administrateur|administrator)|admin\w*\s*(contrasena|passwort)",
+        r"忽略.{0,10}(指令|说明|规则|提示)",
+]
+
+# Leetspeak (1gnore, passw0rd) and letter-spacing (i g n o r e) are tried as extra
+# *variants* of the text, so the regexes above do not need a copy per disguise.
+_LEET = str.maketrans("013457@$", "oieastas")
+_SPACED_RUN = re.compile(r"(?<![^\W_])(?:[^\W_][ .\-_*]){3,}[^\W_](?![^\W_])")
+
+
+def _despace(text: str) -> str:
+    """Join runs of single characters separated by spaces/dots/dashes."""
+    return _SPACED_RUN.sub(lambda m: re.sub(r"[ .\-_*]", "", m.group(0)), text)
+
+
+def _variants(user_input: str) -> list[str]:
+    base = _canonicalize(user_input)
+    despaced = _despace(base)
+    seen, out = set(), []
+    for v in (base, base.translate(_LEET), despaced, despaced.translate(_LEET)):
+        if v not in seen:
+            seen.add(v)
+            out.append(v)
+    return out
+
+
+# Hard limit on message size: stops token-flood / cost attacks and keeps the
+# regex work bounded. Real banking questions are far shorter.
+MAX_INPUT_CHARS = 2000
+
+
+def too_long(user_input: str) -> bool:
+    return len(user_input or "") > MAX_INPUT_CHARS
+
+
+def find_injection(user_input: str):
+    """Return ``(index, pattern, matched_text)`` of the first matching injection
+    pattern, or ``None``. Shared by detect_injection() and the trace UI."""
+    for text in _variants(user_input):
+        for i, pattern in enumerate(INJECTION_PATTERNS):
+            m = re.search(pattern, text, re.IGNORECASE)
+            if m:
+                return i, pattern, m.group(0)
+    return None
+
+
 def detect_injection(user_input: str) -> InputStatus:
     """Detect prompt injection patterns in user input.
 
@@ -51,16 +191,7 @@ def detect_injection(user_input: str) -> InputStatus:
     Returns:
         ``"BLOCK"`` if injection detected (chặn), ``"ALLOW"`` otherwise (cho qua).
     """
-    INJECTION_PATTERNS = [
-        # TODO: Add at least 5 regex patterns
-        # Example:
-        # r"ignore (all )?(previous|above) instructions",
-    ]
-
-    for pattern in INJECTION_PATTERNS:
-        if re.search(pattern, user_input, re.IGNORECASE):
-            return "BLOCK"
-    return "ALLOW"
+    return "BLOCK" if find_injection(user_input) else "ALLOW"
 
 
 # ============================================================
@@ -84,14 +215,24 @@ def topic_filter(user_input: str) -> InputStatus:
         ``"BLOCK"`` = chặn (off-topic hoặc topic cấm).
         ``"ALLOW"`` = cho qua (câu banking hợp lệ).
     """
-    input_lower = user_input.lower()
+    input_lower = _canonicalize(user_input).lower()
 
-    # TODO: Implement logic:
-    # 1. If input contains any blocked topic -> return "BLOCK"
-    # 2. If input doesn't contain any allowed topic -> return "BLOCK"
-    # 3. Otherwise -> return "ALLOW"
-
-    pass  # Replace with your implementation
+    # 1. Blocked topic -> BLOCK (config list + a few harmful-intent terms)
+    if any(re.search(rf"\b{re.escape(t)}", input_lower) for t in BLOCKED_TOPICS):
+        return "BLOCK"
+    if _EXTRA_BLOCKED_RE.search(input_lower):
+        return "BLOCK"
+    # 2. No allowed topic -> BLOCK (off-topic, empty input).
+    #    ALLOWED_TOPICS (config) is supplemented with everyday banking words so
+    #    ordinary questions ("card limit", "reset my PIN", "nearest branch")
+    #    are not false positives. Short words need whole-word matches.
+    if not (
+        any(re.search(rf"\b{re.escape(t)}", input_lower) for t in ALLOWED_TOPICS)
+        or _EXTRA_BANKING_RE.search(input_lower)
+    ):
+        return "BLOCK"
+    # 3. Banking-related -> ALLOW
+    return "ALLOW"
 
 
 # ============================================================
@@ -144,14 +285,29 @@ class InputGuardrailPlugin(base_plugin.BasePlugin):
         self.total_count += 1
         text = self._extract_text(user_message)
 
-        # TODO: Implement logic:
-        # 1. Call detect_injection(text)
-        #    - If "BLOCK": increment blocked_count, return self._block_response("...")
-        # 2. Call topic_filter(text)
-        #    - If "BLOCK": increment blocked_count, return self._block_response("...")
-        # 3. If both return "ALLOW": return None (let message through)
+        # 0. Size cap first: cheap, and bounds the work done by everything below
+        if too_long(text):
+            self.blocked_count += 1
+            return self._block_response(
+                f"Message too long (max {MAX_INPUT_CHARS} characters). "
+                "Please shorten your question."
+            )
 
-        pass  # Replace with your implementation
+        if detect_injection(text) == "BLOCK":
+            self.blocked_count += 1
+            return self._block_response(
+                "Request blocked: potential prompt injection or request for "
+                "confidential information detected."
+            )
+
+        if topic_filter(text) == "BLOCK":
+            self.blocked_count += 1
+            return self._block_response(
+                "Sorry, I can only help with VinBank banking topics "
+                "(accounts, transfers, loans, savings, cards)."
+            )
+
+        return None
 
 
 # ============================================================

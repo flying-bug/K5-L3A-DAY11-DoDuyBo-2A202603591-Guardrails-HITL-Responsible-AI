@@ -4,6 +4,9 @@ Checkpoint 2 — Output Guardrails
   - OutputGuardrailPlugin (ADK)           ← bắt buộc
   - LLM-as-Judge                          ← optional (không chấm)
 """
+import base64
+import binascii
+import codecs
 import re
 import textwrap
 
@@ -12,6 +15,7 @@ from google.adk.agents import llm_agent
 from google.adk import runners
 from google.adk.plugins import base_plugin
 
+from core.config import DEMO_SECRETS
 from core.utils import chat_with_agent
 
 
@@ -27,6 +31,96 @@ from core.utils import chat_with_agent
 # - "redacted": cleaned response (PII replaced with [REDACTED])
 # ============================================================
 
+def _squash(text: str) -> str:
+    """Lower-case and keep only letters/digits (drops spaces, dashes, dots...)."""
+    return re.sub(r"[^a-z0-9]", "", text.casefold())
+
+
+# One entry per distinct secret (DEMO_SECRETS also lists squashed duplicates).
+_SECRETS: list[str] = []
+for _s in DEMO_SECRETS:
+    if len(_squash(_s)) >= 6 and _squash(_s) not in {_squash(x) for x in _SECRETS}:
+        _SECRETS.append(_s)
+_SECRET_KEYS = [_squash(s) for s in _SECRETS]
+
+
+def _tolerant_pattern(secret: str) -> re.Pattern:
+    """Matches the secret even with up to 3 separator chars between characters
+    (``a-d-m-i-n-1-2-3``, ``a d m i n 1 2 3``)."""
+    chars = [re.escape(c) for c in secret if c.isalnum()]
+    return re.compile(r"[\W_]{0,3}".join(chars), re.IGNORECASE)
+
+
+_SECRET_PATTERNS = [_tolerant_pattern(s) for s in _SECRETS]
+_B64_TOKEN = re.compile(r"[A-Za-z0-9+/_-]{8,}={0,2}")
+_HEX_TOKEN = re.compile(r"(?:[0-9a-fA-F]{2}){4,}")
+
+
+def _decoded_views(text: str) -> list[tuple[str, str]]:
+    """Alternative readings of ``text`` an attacker could use to smuggle a secret
+    past a literal match: reversed, ROT13, base64 and hex tokens (+ reversed)."""
+    views: list[tuple[str, str]] = [
+        ("reversed", text[::-1]),
+        ("rot13", codecs.decode(text, "rot13")),
+    ]
+    for tok in _B64_TOKEN.findall(text)[:50]:
+        try:
+            padded = tok.replace("-", "+").replace("_", "/")
+            padded += "=" * (-len(padded) % 4)
+            views.append(("base64", base64.b64decode(padded).decode("utf-8", "ignore")))
+        except (binascii.Error, ValueError):
+            pass
+    for tok in _HEX_TOKEN.findall(text)[:50]:
+        try:
+            views.append(("hex", bytes.fromhex(tok).decode("utf-8", "ignore")))
+        except ValueError:
+            pass
+    views += [(f"{k}+reversed", v[::-1]) for k, v in list(views) if k in ("base64", "hex")]
+    return views
+
+
+def find_encoded_secret(text: str) -> list[str]:
+    """Names of the encodings (reversed/rot13/base64/hex) under which a protected
+    secret appears in ``text``. Deterministic: only the known secrets matter, so
+    this works whatever phrasing the attacker used to ask for them."""
+    found = []
+    for kind, view in _decoded_views(text):
+        squashed = _squash(view)
+        if any(key in squashed for key in _SECRET_KEYS) and kind not in found:
+            found.append(kind)
+    return found
+
+
+# name -> compiled regex. A group named ``x`` means "redact only that group"
+# (keeps the label, e.g. "CCCD [REDACTED]"). Order matters.
+_PII_PATTERNS: list[tuple[str, re.Pattern]] = [
+    # CCCD: 12 digits (optionally grouped by 3). A bare 9-digit number is NOT an ID
+    # (it is usually an amount); CMND 9 digits only counts when labelled.
+    ("national_id", re.compile(r"(?<!\d)\d{3}[ .-]?\d{3}[ .-]?\d{3}[ .-]?\d{3}(?!\d)")),
+    ("national_id", re.compile(
+        r"(?:cmnd|cccd|cmt|can\s*cuoc|căn\s*cước|chứng\s*minh|national\s*id|id\s*number)"
+        r"[^\d]{0,20}(?P<x>\d{9}|\d{12})(?!\d)", re.IGNORECASE)),
+    # VN phone: 0xxxxxxxxx / +84xxxxxxxxx, tolerating spaces, dots, dashes
+    ("phone", re.compile(r"(?<!\d)(?:\+84|0)(?:[\s.\-]?\d){9,10}(?!\d)")),
+    ("email", re.compile(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)*\.[a-zA-Z]{2,}")),
+    ("email", re.compile(
+        r"[\w.+-]+\s*(?:\(at\)|\[at\])\s*[\w-]+(?:\s*(?:\(dot\)|\[dot\])\s*[\w-]+)+",
+        re.IGNORECASE)),
+    ("api_key", re.compile(r"\bsk-[a-zA-Z0-9_-]+", re.IGNORECASE)),
+    ("password", re.compile(r"password\s*(?:is\s*|[:=]\s*)\S+", re.IGNORECASE)),
+]
+
+
+def _redact(pattern: re.Pattern, text: str) -> tuple[str, int]:
+    def repl(m: re.Match) -> str:
+        if "x" in pattern.groupindex:
+            s, e, off = m.start("x"), m.end("x"), m.start()
+            return m.group(0)[: s - off] + "[REDACTED]" + m.group(0)[e - off:]
+        return "[REDACTED]"
+
+    return pattern.subn(repl, text)
+
+
 def content_filter(response: str) -> dict:
     """Filter response for PII, secrets, and harmful content.
 
@@ -37,23 +131,26 @@ def content_filter(response: str) -> dict:
         dict with 'safe', 'issues', and 'redacted' keys
     """
     issues = []
-    redacted = response
+    redacted = response or ""
 
-    # PII patterns to check
-    PII_PATTERNS = {
-        # TODO: Add regex patterns for:
-        # - VN phone number: r"0\d{9,10}"
-        # - Email: r"[\w.-]+@[\w.-]+\.[a-zA-Z]{2,}"
-        # - National ID (CMND/CCCD): r"\b\d{9}\b|\b\d{12}\b"
-        # - API key pattern: r"sk-[a-zA-Z0-9-]+"
-        # - Password pattern: r"password\s*[:=]\s*\S+"
-    }
+    # 1. PII + credential formats
+    for name, pattern in _PII_PATTERNS:
+        redacted, n = _redact(pattern, redacted)
+        if n:
+            issues.append(f"{name}: {n} found")
 
-    for name, pattern in PII_PATTERNS.items():
-        matches = re.findall(pattern, response, re.IGNORECASE)
-        if matches:
-            issues.append(f"{name}: {len(matches)} found")
-            redacted = re.sub(pattern, "[REDACTED]", redacted, flags=re.IGNORECASE)
+    # 2. Known protected values, literal or with separators between characters
+    for pattern in _SECRET_PATTERNS:
+        redacted, n = pattern.subn("[REDACTED]", redacted)
+        if n:
+            issues.append("secret: protected value found")
+
+    # 3. Known protected values hidden by an encoding (reversed / ROT13 /
+    #    base64 / hex): cannot be cut out precisely, so withhold the whole reply.
+    kinds = find_encoded_secret(redacted)
+    if kinds:
+        issues.append(f"secret: encoded value ({', '.join(kinds)})")
+        redacted = "[REDACTED] (reply withheld: it contained an encoded protected value)"
 
     return {
         "safe": len(issues) == 0,
@@ -172,16 +269,29 @@ class OutputGuardrailPlugin(base_plugin.BasePlugin):
         if not response_text:
             return llm_response
 
-        # TODO: Implement logic:
-        # 1. Call content_filter(response_text)
-        #    - If issues found: replace llm_response.content with redacted version
-        #    - Increment self.redacted_count
-        # 2. If use_llm_judge: call llm_safety_check(response_text)
-        #    - If unsafe: replace llm_response.content with a safe message
-        #    - Increment self.blocked_count
-        # 3. Return llm_response (possibly modified)
+        # 1. Redact PII / secrets
+        result = content_filter(response_text)
+        if not result["safe"]:
+            self.redacted_count += 1
+            llm_response.content = types.Content(
+                role="model",
+                parts=[types.Part.from_text(text=result["redacted"])],
+            )
+            response_text = result["redacted"]
 
-        return llm_response  # TODO: modify if needed
+        # 2. Optional LLM-as-Judge
+        if self.use_llm_judge:
+            verdict = await llm_safety_check(response_text)
+            if not verdict["safe"]:
+                self.blocked_count += 1
+                llm_response.content = types.Content(
+                    role="model",
+                    parts=[types.Part.from_text(
+                        text="I'm sorry, I can't provide that response."
+                    )],
+                )
+
+        return llm_response
 
 
 # ============================================================
