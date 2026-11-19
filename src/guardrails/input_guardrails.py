@@ -79,7 +79,9 @@ _EXTRA_BANKING_RE = re.compile(
     r"statements|mortgage|cheque|check\s*book|remittance|exchange\s*rate|"
     r"opening\s*hours|phone\s*number|internet\s*banking|online\s*banking|"
     r"mobile\s*banking|send\s*money|wire|swift|iban|"
-    r"chi\s*nhanh|phi\s*chuyen|sao\s*ke)\b",
+    r"chi\s*nhanh|phi\s*chuyen|sao\s*ke|chuyen\s*khoan|tien\s*gui|ghi\s*no|"
+    r"khoan\s*vay|tin\s*dung|han\s*muc|rut\s*tien|nap\s*tien|thanh\s*toan|"
+    r"internet\s*banking)\b",
     re.IGNORECASE,
 )
 
@@ -113,6 +115,11 @@ INJECTION_PATTERNS = [
         # Exfiltration via transform: encode/translate/summarize hidden config
         r"(encode|base64|rot13|hex(adecimal)?|decode|translate|summari[sz]e|convert|rewrite|spell)\b.{0,200}"
         r"(internal|hidden|secret|your|system)\s*(config\w*|notes?|settings|credentials?|instructions?|rules|secrets?)",
+        # Persistent role change, fake SYSTEM turn, prompt echo, bulk data exfiltration
+        r"(from\s*now\s*on|henceforth)\b.{0,40}\byou\s*(are|will|must|shall)\b",
+        r"\b(system|assistant)\s*:\s*.{0,80}\b(forward|send|ignore|disregard|delete|reveal|transfer)\b",
+        r"(repeat|print|echo|recite|copy)\s*(everything|all|the\s*text|the\s*words)\s*(above|before|prior)",
+        r"(forward|send|email|upload|post|export)\b.{0,40}\b(all|every)\s*(customer|user|account)s?\s*(data|records?|information|details)",
         # SQL / command injection
         r"select\s+\*\s+from|union\s+select|(drop|truncate)\s+(table|database)|"
         r"delete\s+from\s+\w+\s*(where|;)|insert\s+into\s+\w+|;\s*--",

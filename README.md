@@ -1,5 +1,8 @@
 # Day 11 — Controlled Agent Security (2026)
 
+**Học viên:** Đỗ Duy Bộ · **MSSV:** 2A202603591  
+**Chạy nhanh:** `python src/main.py --part 2|3|4` → `pytest tests -q` → `python scripts/grade.py --submission-dir . --out outputs/grade_report.json`
+
 > 👤 **Hình thức:** bài tập **cá nhân** (1 người / 1 MSSV).  
 > 🎯 **Mục tiêu:** đóng vai **Blue Team** để học cách xây Guardrails phòng thủ, rồi đóng vai **Red Team** để tấn công agent **Red** hoặc **Red Advance**.  
 > ✅ Làm theo **Checkpoint 1 → 5** trong [`CHECKPOINTS.md`](CHECKPOINTS.md) · nộp theo [`SUBMISSION.md`](SUBMISSION.md).
