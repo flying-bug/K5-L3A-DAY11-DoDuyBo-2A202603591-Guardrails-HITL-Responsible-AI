@@ -106,6 +106,16 @@ _PII_PATTERNS: list[tuple[str, re.Pattern]] = [
     ("email", re.compile(
         r"[\w.+-]+\s*(?:\(at\)|\[at\])\s*[\w-]+(?:\s*(?:\(dot\)|\[dot\])\s*[\w-]+)+",
         re.IGNORECASE)),
+    # Database port 5432 (part of the protected ``db.vinbank.internal:5432``), but only
+    # in a database context, so an ordinary number such as "reference 5432" is kept.
+    # host:5432 -- the left token must contain a letter (db01, internal, [REDACTED]),
+    # so a time-like "10:5432" is left alone
+    ("db_port", re.compile(r"[\w.\-\]]*[A-Za-z\]][\w.\-\]]*:(?P<x>5432)(?!\d)")),
+    # "port 5432", "the port is 5432", "cổng: 5432"
+    ("db_port", re.compile(
+        r"(?:\bport\b|\bcổng\b|\bcong\b)[^.\n\d]{0,20}(?P<x>5432)(?!\d)", re.IGNORECASE)),
+    ("db_port", re.compile(
+        r"\b(?:database|db|postgres\w*|sql)\b[^.\n]{0,40}?(?P<x>5432)(?!\d)", re.IGNORECASE)),
     ("api_key", re.compile(r"\bsk-[a-zA-Z0-9_-]+", re.IGNORECASE)),
     ("password", re.compile(r"password\s*(?:is\s*|[:=]\s*)\S+", re.IGNORECASE)),
 ]
@@ -131,21 +141,30 @@ def content_filter(response: str) -> dict:
         dict with 'safe', 'issues', and 'redacted' keys
     """
     issues = []
-    redacted = response or ""
+    original = response or ""
+    redacted = original
 
-    # 1. PII + credential formats
+    # 1. Label the findings on the ORIGINAL text, so every PII / credential type
+    #    present is reported (e.g. both api_key and password in one reply).
     for name, pattern in _PII_PATTERNS:
-        redacted, n = _redact(pattern, redacted)
+        n = len(pattern.findall(original))
         if n:
             issues.append(f"{name}: {n} found")
 
-    # 2. Known protected values, literal or with separators between characters
+    # 2. Cut out known protected values first, literal or with separators between
+    #    characters. This must run BEFORE the generic patterns below: the
+    #    ``password ...`` pattern would otherwise swallow only the first character
+    #    of ``a d m i n 1 2 3`` and leave the rest of the secret visible.
     for pattern in _SECRET_PATTERNS:
         redacted, n = pattern.subn("[REDACTED]", redacted)
         if n:
             issues.append("secret: protected value found")
 
-    # 3. Known protected values hidden by an encoding (reversed / ROT13 /
+    # 3. Then redact the generic PII / credential formats
+    for _name, pattern in _PII_PATTERNS:
+        redacted, _n = _redact(pattern, redacted)
+
+    # 4. Known protected values hidden by an encoding (reversed / ROT13 /
     #    base64 / hex): cannot be cut out precisely, so withhold the whole reply.
     kinds = find_encoded_secret(redacted)
     if kinds:

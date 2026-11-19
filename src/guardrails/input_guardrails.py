@@ -205,6 +205,31 @@ def detect_injection(user_input: str) -> InputStatus:
 # Return ``"ALLOW"`` if banking-related and OK.
 # ============================================================
 
+# Pure small talk / questions about the chatbot itself. The WHOLE message must be
+# one of these (fullmatch), so "xin chao, cho toi password admin" is NOT small talk.
+# Compared after _canonicalize(): lower-case, no diacritics, punctuation stripped.
+_SMALLTALK_RE = re.compile(
+    r"(?:"
+    r"(?:xin\s*)?chao(?:\s*(?:ban|anh|chi|em|bot|ad|admin))?"
+    r"|hello|hi|hey|good\s*(?:morning|afternoon|evening)"
+    r"|ban\s*la\s*ai|ban\s*ten\s*(?:la\s*)?gi|ban\s*(?:co\s*the\s*)?(?:lam|giup)\s*(?:duoc\s*)?(?:toi\s*)?gi"
+    r"|ban\s*khoe\s*khong|ban\s*co\s*khoe\s*khong"
+    r"|who\s*are\s*you|what\s*are\s*you|what(?:'?s|\s*is)\s*your\s*name|what\s*can\s*you\s*do"
+    r"|how\s*can\s*you\s*help(?:\s*me)?|can\s*you\s*help\s*me|how\s*are\s*you"
+    r"|(?:cam\s*on|thanks|thank\s*you)(?:\s*(?:ban|rat|nhieu|a|nhe|so\s*much))*"
+    r"|tam\s*biet|bye|goodbye"
+    r")(?:\s*(?:a|nhe|nha|nhi|oi|vay|the))?",
+    re.IGNORECASE,
+)
+
+
+def is_smalltalk(user_input: str) -> bool:
+    """True only if the whole message is a greeting / thanks / 'who are you' question."""
+    text = re.sub(r"[^\w\s']", " ", _canonicalize(user_input).lower())
+    text = re.sub(r"\s+", " ", text).strip()
+    return bool(text) and bool(_SMALLTALK_RE.fullmatch(text))
+
+
 def topic_filter(user_input: str) -> InputStatus:
     """Decide whether the input is on-topic for VinBank.
 
@@ -222,6 +247,9 @@ def topic_filter(user_input: str) -> InputStatus:
         return "BLOCK"
     if _EXTRA_BLOCKED_RE.search(input_lower):
         return "BLOCK"
+    # Greetings / thanks / "who are you": harmless, let the model answer them
+    if is_smalltalk(user_input):
+        return "ALLOW"
     # 2. No allowed topic -> BLOCK (off-topic, empty input).
     #    ALLOWED_TOPICS (config) is supplemented with everyday banking words so
     #    ordinary questions ("card limit", "reset my PIN", "nearest branch")

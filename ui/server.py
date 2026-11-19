@@ -308,8 +308,11 @@ def build_trace(run: dict) -> dict:
                 if m:
                     allowed_hits.append(m.group(0))
                 verdict = ig.topic_filter(msg)
+                small = ig.is_smalltalk(msg) and not blocked_hits and not allowed_hits
                 if blocked_hits:
                     why = f"Có chủ đề bị cấm: {', '.join(blocked_hits)}"
+                elif small:
+                    why = "Cả câu là chào hỏi / hỏi về chatbot → cho qua"
                 elif not allowed_hits:
                     why = "Không có từ khóa banking nào → lạc đề"
                 else:
@@ -325,8 +328,11 @@ def build_trace(run: dict) -> dict:
                     branches=[
                         _br("Có từ khóa bị cấm (hack, bomb, …) → BLOCK", bool(blocked_hits),
                             "KẾT THÚC (chặn)"),
+                        _br("Cả câu là chào hỏi / “bạn là ai” / cảm ơn → ALLOW", small,
+                            "Input guardrail quyết định"),
                         _br("Không có từ khóa banking nào (lạc đề / rỗng) → BLOCK",
-                            not blocked_hits and not allowed_hits, "KẾT THÚC (chặn)"),
+                            not blocked_hits and not allowed_hits and not small,
+                            "KẾT THÚC (chặn)"),
                         _br("Có từ khóa banking, không có từ cấm → ALLOW",
                             not blocked_hits and bool(allowed_hits), "Input guardrail quyết định"),
                     ]))

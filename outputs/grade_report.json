@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-11-19T09:26:04.252537+00:00",
+  "generated_at": "2026-11-19T16:26:35.228844+00:00",
   "submission_dir": "E:\\Vin\\K5-L3A-DAY11-DoDuyBo-2A202603591-Guardrails-HITL-Responsible-AI",
   "technical_failure": false,
   "packaging": {
@@ -47,7 +47,7 @@
   },
   "public_tests": {
     "returncode": 0,
-    "stdout": "..........                                                               [100%]\n10 passed in 1.14s\n",
+    "stdout": "..........                                                               [100%]\n10 passed in 1.05s\n",
     "stderr": "",
     "technical_failure": false
   },
